@@ -1,0 +1,16 @@
+{
+  "new_file": ["Command+N"],
+  "new_folder": ["Command+Shift+N"],
+  "open": ["Command+O"],
+  "save": ["Command+S"],
+  "save_as": ["Command+Shift+S"],
+  "close_tab": ["Command+W"],
+  "undo": ["Command+Z"],
+  "redo": ["Command+Shift+Z", "Command+Y"],
+  "next_tab": ["Ctrl+Tab"],
+  "previous_tab": ["Ctrl+Shift+Tab"],
+  "toggle_sidebar": ["Command+B"],
+  "cancel": ["Escape"],
+  "reader_next_page": ["PageDown"],
+  "reader_previous_page": ["PageUp"]
+}

@@ -1,0 +1,20 @@
+[package]
+name = "enote"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+iced = { version = "0.14.0", features = ["image", "advanced"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico", "tiff"] }
+tempfile = "3.27.0"
+lucide-icons = "1.57.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+uuid = { version = "1.28.0", features = ["v4", "serde"] }
+mupdf = { version = "0.8.0", default-features = false, features = ["epub", "html", "cbz", "xps", "base14-fonts", "system-fonts"] }
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+rfd = "0.17.2"
+
+[dev-dependencies]
+zip = { version = "0.6.6", default-features = false, features = ["deflate"] }

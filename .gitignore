@@ -1,0 +1,28 @@
+# Cargo build output and local application bundles
+/target/
+/dist/
+
+# Local volumes and runtime state
+.enote/
+
+# Operating-system metadata
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
+
+# Local editor configuration and temporary files
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+*.rs.bk
+*.log
+
+# Local environment files (keep example configuration)
+.env
+.env.*
+!.env.example
+
+# Cargo.lock is intentionally tracked: eNote is an application.
