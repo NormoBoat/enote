@@ -13,10 +13,14 @@ pub enum Phase {
     Leave,
 }
 
+type EventHandler<'a, Message> = Box<dyn Fn(Phase, Point, Rectangle) -> Message + 'a>;
+
 pub struct DragArea<'a, Message> {
     content: Element<'a, Message>,
-    on_event: Option<Box<dyn Fn(Phase, Point) -> Message + 'a>>,
+    on_event: Option<EventHandler<'a, Message>>,
     interaction: mouse::Interaction,
+    intercept: bool,
+    observe: bool,
 }
 
 #[derive(Default)]
@@ -44,7 +48,45 @@ impl<'a, Message> DragArea<'a, Message> {
         Self {
             content: content.into(),
             interaction,
+            on_event: Some(Box::new(move |phase, point, _| on_event(phase, point))),
+            intercept: false,
+            observe: false,
+        }
+    }
+
+    pub fn with_bounds(
+        content: impl Into<Element<'a, Message>>,
+        interaction: mouse::Interaction,
+        on_event: impl Fn(Phase, Point, Rectangle) -> Message + 'a,
+    ) -> Self {
+        Self {
+            content: content.into(),
+            interaction,
             on_event: Some(Box::new(on_event)),
+            intercept: false,
+            observe: false,
+        }
+    }
+
+    pub fn observe(
+        content: impl Into<Element<'a, Message>>,
+        on_event: impl Fn(Phase, Point, Rectangle) -> Message + 'a,
+    ) -> Self {
+        Self {
+            observe: true,
+            ..Self::with_bounds(content, mouse::Interaction::None, on_event)
+        }
+    }
+
+    /// A drop target consumes pointer input while an external drag is active,
+    /// before editors or scrollable children can capture the release.
+    pub fn drop_target(
+        content: impl Into<Element<'a, Message>>,
+        on_event: impl Fn(Phase, Point, Rectangle) -> Message + 'a,
+    ) -> Self {
+        Self {
+            intercept: true,
+            ..Self::with_bounds(content, mouse::Interaction::Grabbing, on_event)
         }
     }
 
@@ -53,6 +95,8 @@ impl<'a, Message> DragArea<'a, Message> {
             content: content.into(),
             on_event: None,
             interaction: mouse::Interaction::None,
+            intercept: false,
+            observe: false,
         }
     }
 }
@@ -114,16 +158,18 @@ impl<Message> Widget<Message, Theme, Renderer> for DragArea<'_, Message> {
         }
         // iced may batch input with a cursor already at the final event position.
         let event_cursor = position.map(mouse::Cursor::Available).unwrap_or(cursor);
-        self.content.as_widget_mut().update(
-            &mut tree.children[0],
-            event,
-            layout,
-            event_cursor,
-            renderer,
-            clipboard,
-            shell,
-            viewport,
-        );
+        if !self.intercept || !matches!(event, Event::Mouse(_) | Event::Touch(_)) {
+            self.content.as_widget_mut().update(
+                &mut tree.children[0],
+                event,
+                layout,
+                event_cursor,
+                renderer,
+                clipboard,
+                shell,
+                viewport,
+            );
+        }
         let Some(on_event) = &self.on_event else {
             return;
         };
@@ -148,16 +194,22 @@ impl<Message> Widget<Message, Theme, Renderer> for DragArea<'_, Message> {
         if matches!(phase, Phase::Move) {
             let state = tree.state.downcast_mut::<State>();
             if over || state.hovered {
-                shell.publish(on_event(if over { phase } else { Phase::Leave }, position));
+                shell.publish(on_event(
+                    if over { phase } else { Phase::Leave },
+                    position,
+                    layout.bounds(),
+                ));
             }
-            if over {
+            if over && !self.observe {
                 shell.capture_event();
             }
             state.hovered = over;
-        } else if over && !shell.is_event_captured() {
+        } else if over && (self.observe || self.intercept || !shell.is_event_captured()) {
             tree.state.downcast_mut::<State>().hovered = true;
-            shell.publish(on_event(phase, position));
-            shell.capture_event();
+            shell.publish(on_event(phase, position, layout.bounds()));
+            if !self.observe {
+                shell.capture_event();
+            }
         }
     }
     fn mouse_interaction(

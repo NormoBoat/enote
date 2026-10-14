@@ -155,7 +155,12 @@ impl LoadedFile {
             .to_string_lossy()
             .to_ascii_lowercase();
         let kind = match extension.as_str() {
-            "pdf" | "epub" | "fb2" | "mobi" | "cbz" | "xps" | "oxps" => Some(MediaKind::Document),
+            "mobi" | "xps" | "oxps" => {
+                return Err(
+                    "This document format is no longer supported; use PDF, EPUB, FB2 or CBZ".into(),
+                );
+            }
+            "pdf" | "epub" | "fb2" | "cbz" => Some(MediaKind::Document),
             "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "tif" | "tiff" => {
                 Some(MediaKind::Image)
             }

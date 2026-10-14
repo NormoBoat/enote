@@ -1,6 +1,7 @@
 use crate::explorer::Directory;
 use enote::{
-    session::SessionStore,
+    buffer::LoadedFile,
+    session::{SessionStore, WindowPlacement, WorkspaceSession},
     settings::{LoadedSettings, Settings, SettingsPaths, SettingsStore},
     volume::VolumeStorage,
 };
@@ -12,6 +13,8 @@ pub struct OpenedVolume {
     pub directory: Directory,
     pub settings: LoadedSettings,
     pub trash: Option<enote::file_ops::TrashRecord>,
+    pub workspace: WorkspaceSession,
+    pub restored_files: Vec<(usize, LoadedFile)>,
 }
 
 impl OpenedVolume {
@@ -29,6 +32,29 @@ impl OpenedVolume {
         let directory = Directory::read(&storage.root)?;
         let mut settings = base.clone();
         settings.apply_file(&storage.settings_path());
+        let workspace = match WorkspaceSession::load(&storage.root) {
+            Ok(workspace) => workspace,
+            Err(message) => {
+                settings.warnings.push(enote::settings::SettingsError {
+                    path: storage.root.join(".enote/workspace-state.json"),
+                    message,
+                });
+                WorkspaceSession::default()
+            }
+        };
+        let mut restored_files = Vec::new();
+        for (index, relative) in workspace.tabs.iter().enumerate() {
+            let path = storage.root.join(relative);
+            match storage
+                .document_path(&path)
+                .and_then(|path| LoadedFile::read(&path))
+            {
+                Ok(file) => restored_files.push((index, file)),
+                Err(message) => settings
+                    .warnings
+                    .push(enote::settings::SettingsError { path, message }),
+            }
+        }
         let trash = match storage.latest_trash() {
             Ok(trash) => trash,
             Err(message) => {
@@ -44,6 +70,8 @@ impl OpenedVolume {
             directory,
             settings,
             trash,
+            workspace,
+            restored_files,
         })
     }
 }
@@ -54,6 +82,7 @@ pub struct Startup {
     pub session: Option<SessionStore>,
     pub volume: Option<OpenedVolume>,
     pub warnings: String,
+    pub window: Option<WindowPlacement>,
 }
 
 impl Startup {
@@ -65,6 +94,7 @@ impl Startup {
                 session: None,
                 volume: None,
                 warnings: error.to_string(),
+                window: None,
             },
         }
     }
@@ -92,11 +122,19 @@ impl Startup {
             .unwrap_or(&base);
         let mut warnings: Vec<_> = loaded.warnings.iter().map(ToString::to_string).collect();
         warnings.extend(restore_warning);
+        let window = match session.window() {
+            Ok(window) => window,
+            Err(error) => {
+                warnings.push(error);
+                None
+            }
+        };
         Self {
             base,
             session: Some(session),
             volume,
             warnings: warnings.join("\n"),
+            window,
         }
     }
 
@@ -175,6 +213,39 @@ mod tests {
         assert_eq!(
             fs::read_to_string(volume.settings_path()).unwrap(),
             "broken"
+        );
+    }
+
+    #[test]
+    fn portable_workspace_survives_moving_volume_and_skips_missing_tabs() {
+        let dir = tempfile::tempdir().unwrap();
+        let volume = VolumeStorage::create(dir.path(), "Notes").unwrap();
+        fs::write(volume.root.join("note.mde"), "Portable note").unwrap();
+        WorkspaceSession {
+            tabs: vec!["note.mde".into(), "missing.pdf".into()],
+            active: Some(0),
+            layout: enote::session::PaneLayout::Pane { tab: Some(0) },
+            ..Default::default()
+        }
+        .save(&volume.root)
+        .unwrap();
+        let moved = dir.path().join("Moved");
+        fs::rename(&volume.root, &moved).unwrap();
+        let opened =
+            OpenedVolume::open(&moved, &LoadedSettings::from_settings(Settings::default()))
+                .unwrap();
+        assert_eq!(opened.restored_files.len(), 1);
+        assert_eq!(opened.restored_files[0].0, 0);
+        assert_eq!(
+            opened.restored_files[0].1.path(),
+            moved.join("note.mde").canonicalize().unwrap()
+        );
+        assert!(
+            opened
+                .settings
+                .warnings
+                .iter()
+                .any(|w| w.path.ends_with("missing.pdf"))
         );
     }
 }

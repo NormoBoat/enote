@@ -1,7 +1,7 @@
 use crate::{app::Message, appearance as look};
 use enote::{
     buffer::BufferId,
-    reader::{ReadingPosition, RenderedPage},
+    reader::{ReadingPosition, RenderWorker, RenderedPage},
 };
 use iced::{
     Element, Fill,
@@ -29,6 +29,13 @@ pub enum ReaderAction {
 }
 
 #[derive(Debug)]
+pub struct CachedPage {
+    pub handle: image::Handle,
+    pub rendered: RenderedPage,
+    pub render_width: f32,
+}
+
+#[derive(Debug)]
 pub struct Viewer {
     pub position: ReadingPosition,
     pub count: Option<u32>,
@@ -43,7 +50,9 @@ pub struct Viewer {
     pub keep_scroll: bool,
     pub hovered: bool,
     pub page_window: u32,
-    pub pages: BTreeMap<u32, (image::Handle, f32)>,
+    pub pages: BTreeMap<u32, CachedPage>,
+    pub worker: Option<RenderWorker>,
+    pub pixel_width: f32,
 }
 
 impl Viewer {
@@ -61,8 +70,10 @@ impl Viewer {
             restoring: false,
             keep_scroll: false,
             hovered: false,
-            page_window: 2,
+            page_window: 4,
             pages: BTreeMap::new(),
+            worker: None,
+            pixel_width: 1200.0,
         }
     }
 
@@ -70,18 +81,45 @@ impl Viewer {
         format!("document-scroll-{}", id.0)
     }
 
+    pub fn cached_page(&self, page: u32) -> Option<&RenderedPage> {
+        self.pages
+            .get(&page)
+            .filter(|cached| cached.render_width == self.pixel_width)
+            .map(|cached| &cached.rendered)
+    }
+
     pub fn cache_page(&mut self, page: &RenderedPage) {
+        // Keep a stable image handle: recreating it forces another GPU upload.
+        if self.cached_page(page.page).is_some() {
+            return;
+        }
         self.pages.insert(
             page.page,
-            (
-                image::Handle::from_rgba(page.width, page.height, page.rgba.to_vec()),
-                page.height as f32 / page.width as f32,
-            ),
+            CachedPage {
+                handle: image::Handle::from_rgba(
+                    page.width,
+                    page.height,
+                    bytes::Bytes::from_owner(page.rgba.clone()),
+                ),
+                rendered: page.clone(),
+                render_width: self.pixel_width,
+            },
         );
-        self.pages.retain(|number, _| {
-            *number >= self.position.page.saturating_sub(1)
-                && *number < self.position.page.saturating_add(self.page_window)
-        });
+        // Keep recently visited pages in both directions. Old-resolution pages
+        // remain visible until their replacements arrive, with a bounded budget.
+        let mut bytes: usize = self.pages.values().map(|p| p.rendered.rgba.len()).sum();
+        while self.pages.len() > 16 || bytes > 128 * 1024 * 1024 {
+            let Some(farthest) = self
+                .pages
+                .keys()
+                .filter(|n| **n != self.position.page)
+                .max_by_key(|n| (n.abs_diff(self.position.page), **n < self.position.page))
+                .copied()
+            else {
+                break;
+            };
+            bytes -= self.pages.remove(&farthest).unwrap().rendered.rgba.len();
+        }
     }
 
     pub fn slot_height(&self) -> f32 {
@@ -170,7 +208,7 @@ impl Viewer {
         } else {
             let request = self.request;
             let count = self.count.unwrap_or(1);
-            let first = self.position.page.saturating_sub(1);
+            let first = self.position.page.saturating_sub(2);
             let last = self
                 .position
                 .page
@@ -179,9 +217,8 @@ impl Viewer {
             let slot = self.slot_height();
             let mut pages = column![Space::new().height(first as f32 * slot)];
             for page in first..last {
-                let content: Element<'_, Message> = if let Some((handle, _)) = self.pages.get(&page)
-                {
-                    image(handle.clone())
+                let content: Element<'_, Message> = if let Some(cached) = self.pages.get(&page) {
+                    image(cached.handle.clone())
                         .width(self.display_width)
                         .height(slot - 12.0)
                         .content_fit(iced::ContentFit::Contain)
@@ -227,5 +264,52 @@ impl Viewer {
         .on_enter(Message::Reader(id, ReaderAction::Hover(true)))
         .on_exit(Message::Reader(id, ReaderAction::Hover(false)))
         .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn page(number: u32) -> RenderedPage {
+        RenderedPage {
+            page: number,
+            count: 100,
+            width: 2,
+            height: 3,
+            rgba: vec![255; 24].into(),
+        }
+    }
+
+    #[test]
+    fn cache_reuses_texture_handles_and_keeps_old_resolution_visible() {
+        let mut viewer = Viewer::new(Default::default());
+        let rendered = page(0);
+        viewer.cache_page(&rendered);
+        let handle = viewer.pages[&0].handle.clone();
+        let image::Handle::Rgba { pixels, .. } = &handle else {
+            panic!("Expected RGBA image");
+        };
+        assert_eq!(pixels.as_ptr(), rendered.rgba.as_ptr());
+        viewer.cache_page(&page(0));
+        assert_eq!(viewer.pages[&0].handle, handle);
+        viewer.pixel_width += 64.0;
+        assert!(viewer.cached_page(0).is_none());
+        assert_eq!(viewer.pages[&0].handle, handle);
+        viewer.cache_page(&page(0));
+        assert_ne!(viewer.pages[&0].handle, handle);
+    }
+
+    #[test]
+    fn cache_is_bounded_and_retains_nearby_pages_for_reverse_scrolling() {
+        let mut viewer = Viewer::new(Default::default());
+        viewer.position.page = 5;
+        for number in 0..40 {
+            viewer.cache_page(&page(number));
+        }
+        assert!(viewer.pages.len() <= 16);
+        assert!(viewer.pages.contains_key(&5));
+        assert!(viewer.pages.contains_key(&4));
+        assert!(viewer.pages.contains_key(&6));
     }
 }

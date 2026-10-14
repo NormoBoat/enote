@@ -7,14 +7,58 @@ eNote — локальный менеджер заметок на Rust с инт
 
 Сейчас реализованы дерево файлов, создание и перемещение объектов, вкладки,
 редактирование текста с сохранением и undo/redo, разделение рабочего пространства,
-просмотр изображений и документов. PDF, EPUB, FB2, MOBI, CBZ и XPS/OXPS
-отображаются через MuPDF. Вьювер поддерживает непрерывную прокрутку, масштаб
-и запоминание позиции; его нижняя панель появляется при наведении.
+просмотр изображений и документов. Вкладки и панели поддерживают drag-and-drop,
+а рабочее пространство восстанавливается отдельно для каждого вольюма.
+PDF отображается через Hayro, CBZ — через Rust-кодеки изображений,
+EPUB и FB2 — через текстовый рендерер на cosmic-text. Вьювер поддерживает
+непрерывную прокрутку, масштаб и запоминание позиции; его нижняя панель
+появляется при наведении.
+EPUB/FB2 пока отображают текст без CSS и встроенных иллюстраций.
+MOBI и XPS/OXPS больше не поддерживаются.
 
 Новые заметки используют расширение `.mde` (eNote Markdown); сейчас это
 совместимый с Markdown UTF-8 текст. WYSIWYG и расширенные возможности формата
 пока в разработке. Мобильные платформы входят в направление развития,
 но готовых Android/iOS-сборок и мобильных файловых диалогов пока нет.
+
+## Работа с вкладками и панелями
+
+Откройте вольюм через значок папки, затем выберите файл в проводнике.
+Файл открывается во вкладке; повторное открытие выбирает существующий буфер.
+Редактор не содержит нижней информационной панели.
+
+- Перетаскивайте вкладки в верхней полоске, чтобы менять их порядок.
+- Сбросьте вкладку в центр панели, чтобы перенести туда буфер.
+- Сбросьте вкладку к левому, правому, верхнему или нижнему краю панели,
+  чтобы разместить буфер в разделённом рабочем пространстве.
+- Перетаскивайте панель за её заголовок: сброс в центр другой панели меняет
+  панели местами, сброс к краю меняет их расположение.
+- Перетаскивайте разделители для изменения размеров панелей.
+- Escape или отпускание вкладки вне цели отменяет перенос.
+
+Перенос сохраняет текст, историю редактирования и состояние открытого буфера.
+Порядок вкладок, активный буфер, расположение панелей и пропорции разделений
+запоминаются для каждого вольюма. Размер и положение окна запоминаются
+для приложения и сохраняются при переключении между вольюмами.
+Состояние записывается в фоне, а также перед выходом или сменой вольюма.
+Восстановление открывает сохранённые версии файлов; несохранённые правки
+и безымянные буферы после перезапуска не восстанавливаются.
+
+## Просмотр документов
+
+Поддерживаются PDF, CBZ, EPUB и FB2. Страницы рендерятся в отдельном потоке:
+PDF разбирается один раз, а EPUB/FB2 повторно используют подготовленный текст,
+шрифты и пагинацию. Ближайшие страницы загружаются заранее; кэш ограничен
+по памяти. Устаревшие запросы пропускаются при быстрой прокрутке и изменении
+масштаба. Уже загруженные страницы остаются видимыми до готовности замены.
+Скрытые вкладки документов начинают рендериться при показе в панели.
+
+PDF-движок Hayro ещё развивается: сложные PDF могут отображаться иначе,
+чем в MuPDF. Ввод пароля для защищённых документов пока не реализован.
+EPUB/FB2 отображают текст без CSS, встроенных иллюстраций и книжных шрифтов;
+поддерживаются XML-кодировки, включая Windows-1251, и UTF-8/UTF-16 BOM.
+Страницы CBZ упорядочиваются по числам в именах: `page2` идёт перед `page10`.
+MOBI и XPS/OXPS не поддерживаются.
 
 ## Сборка
 
@@ -23,11 +67,10 @@ eNote — локальный менеджер заметок на Rust с инт
 Проект использует Rust edition 2024. Зависимости закреплены в `Cargo.lock`;
 используйте `--locked`, чтобы сборка не меняла их версии.
 
-MuPDF компилируется из исходников автоматически вместе с Cargo-зависимостями:
-отдельный просмотрщик PDF устанавливать не нужно. Для сборки нужны C/C++
-компилятор и libclang для bindgen. Первая сборка требует доступа к реестру
-пакетов, занимает заметно больше времени и места на диске, чем последующие.
-Требования движка описаны в [mupdf-rs](https://github.com/messense/mupdf-rs).
+Рендерер PDF Hayro, разбор EPUB/FB2 и кодеки CBZ написаны на Rust.
+MuPDF, bindgen, libclang и сборка C/C++-библиотек больше не нужны.
+Минимальная версия Rust — 1.92. Первая сборка требует доступа к crates.io.
+Оконный интерфейс использует системные API, графический драйвер и шрифты ОС.
 
 ### macOS
 
@@ -45,45 +88,24 @@ cargo build --release --locked
 ```
 
 Сборка по умолчанию предназначена для архитектуры текущего компьютера:
-Apple Silicon или Intel. Если bindgen не находит libclang, установите LLVM
-через Homebrew и укажите путь к его библиотекам:
-
-```sh
-brew install llvm
-export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
-cargo build --release --locked
-```
+Apple Silicon или Intel. Xcode Command Line Tools нужны для системного
+SDK и линкера, а не для сборки PDF-движка.
 
 Cargo создаёт исполняемый файл, а не подписанный `.app` или `.dmg`.
 Локальные тестовые `.app` внутри `target/` не входят в репозиторий.
 
-### Windows (x64, MSVC)
+### Windows (MSVC)
 
-Установите:
-
-1. Visual Studio 2022 Build Tools с компонентами **Desktop development with C++**,
-   MSVC v143, MSBuild и Windows SDK.
-2. LLVM x64, включая `libclang.dll`.
-3. Rust через rustup с toolchain `stable-x86_64-pc-windows-msvc`.
-
-Откройте Developer PowerShell for VS 2022, перейдите в папку проекта
-и выполните (путь LLVM измените, если он установлен в другом месте):
+Установите Rust через rustup и рекомендованные им MSVC Build Tools / Windows SDK
+для системного линкера. LLVM и libclang не требуются.
 
 ```powershell
-$env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
-cargo +stable-x86_64-pc-windows-msvc build --release --locked
+cargo build --release --locked
 .\target\release\enote.exe
 ```
 
-Если указанный toolchain не установлен:
-
-```powershell
-rustup toolchain install stable-x86_64-pc-windows-msvc
-```
-
-Инструкция рассчитана на x64: используемая версия сборщика MuPDF не
-поддерживает нативную Windows ARM64-сборку через MSVC. Готовый установщик
-не создаётся. Подготовка MSVC описана в
+Cargo создаёт исполняемый файл; готовый установщик не создаётся.
+Подготовка линкера описана в
 [документации Rust](https://rust-lang.github.io/rustup/installation/windows-msvc.html).
 
 ### Linux (Ubuntu / Debian)
@@ -92,9 +114,8 @@ rustup toolchain install stable-x86_64-pc-windows-msvc
 
 ```sh
 sudo apt update
-sudo apt install build-essential pkg-config clang libclang-dev \
-  libfontconfig1-dev libfreetype6-dev libx11-dev libxcursor-dev \
-  libxi-dev libxrandr-dev libxkbcommon-dev libwayland-dev libegl1-mesa-dev
+sudo apt install build-essential libx11-6 libxcursor1 libxi6 libxrandr2 \
+  libxkbcommon0 libegl1 fonts-dejavu-core xwayland
 ```
 
 После установки Rust:
@@ -104,8 +125,10 @@ cargo build --release --locked
 ./target/release/enote
 ```
 
-Для запуска нужна графическая сессия X11 или Wayland и рабочий графический
-драйвер. Файловые диалоги используют XDG Desktop Portal: установите
+Для запуска нужна графическая сессия X11 или Wayland с XWayland и рабочий
+графический драйвер. Нативный Wayland отключён, чтобы исключить C-shim из
+зависимостей настольной сборки. Файловые диалоги используют XDG Desktop Portal:
+установите
 `xdg-desktop-portal` и подходящий backend рабочего окружения
 (например, `xdg-desktop-portal-gtk` для GTK-окружения).
 В других дистрибутивах установите эквивалентные пакеты.
@@ -122,13 +145,16 @@ cargo clippy --locked --all-targets -- -D warnings
 Локально проверены сборка и GUI на macOS. Инструкции для Windows и Linux
 основаны на зависимостях проекта; сборки на этих ОС пока не проверены.
 Собирать следует нативно на нужной ОС: установка Rust target сама по себе
-не обеспечивает кросс-компиляцию MuPDF и системных библиотек.
+не заменяет системный SDK и линкер целевой ОС.
 
 ## Хранение и настройки
 
 В корне вольюма находится скрытая папка `.enote/`: идентификатор вольюма,
-его настройки, позиции чтения и корзина. Проводник приложения её скрывает.
-Последний открытый вольюм восстанавливается при запуске.
+его настройки, рабочее пространство, позиции чтения и корзина. Проводник приложения её скрывает.
+Последний открытый вольюм восстанавливается при запуске вместе с вкладками,
+активным буфером и расположением панелей. Положение и размер окна также
+запоминаются. Панели буферов можно перетаскивать за заголовок: в центр другой
+панели для обмена местами или к краю для изменения расположения.
 
 Настройки объединяются в порядке: встроенные → глобальные → пользовательские
 → настройки текущего вольюма. Пользовательский файл на macOS/Linux:
@@ -156,7 +182,7 @@ cargo clippy --locked --all-targets -- -D warnings
 состояние локальных вольюмов и файлы ОС исключены через `.gitignore`.
 Личные документы не следует хранить внутри репозитория проекта.
 
-MuPDF и его Rust bindings распространяются под AGPL-3.0.
+Hayro распространяется под MIT OR Apache-2.0.
 Сведения о зависимости: [THIRD_PARTY.md](THIRD_PARTY.md).
 
 Ниже приведена подробная техническая справка по текущей реализации.
@@ -226,7 +252,8 @@ opening and saving to the active volume. The right-hand explorer displays its tr
 
 `app.rs` displays buffers in resizable split panes and retains editor state for hidden buffers.
 `file_dialog.rs` isolates desktop dialogs; mobile pickers remain unimplemented.
-Inside a volume the workspace starts empty, with a compact file explorer on the right.
+A new volume starts with an empty workspace and a compact file explorer on the right.
+Reopening a volume restores its last tabs, active buffer and split-pane layout.
 Open a volume with the folder icon; directories expand lazily and files open
 in buffers. Hover a folder (including the root) to show New file and New folder
 icons. Enter a name inline and confirm; cancel creates nothing. On narrow/touch
@@ -244,13 +271,26 @@ binary files have read-only metadata views; playback is not implemented.
 Text and encoded images are limited to 32 MiB, decoded images to 64 MiB.
 Undo and redo each retain up to 100 snapshots or 64 MiB.
 
-PDF, EPUB, FB2, MOBI, CBZ and XPS/OXPS open as read-only document buffers,
-rendered by the open-source MuPDF engine through `mupdf-rs`. The reader has
-page navigation, PageUp/PageDown shortcuts, zoom and fit-width controls.
-Documents are limited to 256 MiB. Password-protected documents show an error;
-password entry, DRM, text selection and document search are not implemented.
-MuPDF is built from source by Cargo and requires a C/C++ compiler and libclang.
-It is licensed under AGPL-3.0; see `THIRD_PARTY.md`.
+PDF, EPUB, FB2 and CBZ open as read-only document buffers. PDF pages use
+[Hayro](https://github.com/LaurenzV/hayro), a pure Rust renderer; CBZ uses `zip`
+and `image`; EPUB/FB2 text is parsed with `roxmltree` and shaped/rasterized with
+`cosmic-text` and Swash. EPUB chapters follow the package spine. Book pagination
+uses fixed logical pages, independent of zoom. The reader retains continuous
+scrolling, zoom and saved positions.
+
+EPUB/FB2 currently display text with paragraph boundaries and Unicode shaping;
+CSS styling, embedded illustrations and book fonts are not rendered. XML
+encoding declarations (including Windows-1251) and UTF-8/UTF-16 BOMs are supported.
+MOBI and XPS/OXPS are no longer supported. Hayro is still evolving, so complex PDFs
+can render differently from MuPDF; password entry is not implemented.
+
+Desktop dependency trees for macOS, Windows and Linux contain no C/C++ build
+libraries (`cc`, `cmake`, `bindgen`, `mupdf-sys`, `freetype-sys`). Linux uses
+X11/XWayland. System windowing APIs, graphics drivers and linkers remain required.
+`Cargo.lock` also records inactive Android dependencies of winit; Android is not
+part of this desktop-only guarantee.
+
+Hayro is licensed under MIT OR Apache-2.0; see `THIRD_PARTY.md`.
 
 The reader stores page, zoom and scroll position in
 `.enote/viewer-state.json`. Positions follow files when moved or renamed inside
@@ -264,11 +304,26 @@ Selecting an already visible buffer focuses its existing pane. Drag pane
 dividers to resize them; closing a pane keeps its buffer and unsaved edits.
 Drag the left edge of the file explorer to change its width for the session.
 
-The document reader scrolls continuously through pages and renders a bounded
-window around the reading position. Previously rendered pages stay visible
-while resizing or zooming. Its compact, single-row controls appear at the
-bottom only while the pointer is over the viewer; very narrow panes allow
-horizontal scrolling of those controls.
+The document reader scrolls continuously through pages and prefetches a bounded
+window ahead of the viewport. Rendering starts when a document is shown in a pane;
+a dedicated worker then reuses PDF parsing/interpreter caches or EPUB/FB2
+layout/font caches between pages. Obsolete queued requests are skipped during fast scrolling, resizing or zooming.
+Rendered image handles are reused; pixel buffers are shared without UI-thread copies.
+CPU bitmap caches are bounded to 64 MiB in the worker and 128 MiB in the viewer
+(shared buffers count toward both budgets); at most 16 pages are retained per cache.
+Old-resolution pages stay visible until replacement images arrive. Output sizes are
+bucketed in 64-pixel steps to avoid rerendering for every small resize.
+Development builds optimize dependencies so CPU rendering also stays fast with
+`cargo run`; the first build after changing this profile recompiles dependencies.
+
+The compact, single-row controls appear at the bottom only while the pointer is
+over the viewer; very narrow panes allow horizontal scrolling of those controls.
+
+Run the optional repeat-navigation microbenchmark with:
+
+```sh
+cargo test --locked --lib benchmark_repeated_document_pages -- --ignored --nocapture
+```
 
 Files created without an extension use `.mde` (eNote Markdown). `.md` remains
 ordinary Markdown. `.mde` currently stores compatible UTF-8 Markdown text and has
@@ -318,7 +373,7 @@ parent folder must exist. Trash records use relative path components and the
 volume UUID, without machine-specific absolute paths. External filesystem
 changes are refreshed manually; a filesystem watcher is not yet implemented.
 
-Markdown WYSIWYG, mobile file pickers, and recovery of open buffers
+Markdown WYSIWYG, mobile file pickers, and recovery of unsaved edits
 are future work. The current GUI and native dialogs are verified on macOS.
 
 ## Volumes
@@ -332,18 +387,38 @@ The root contains a hidden `.enote` directory:
 
 - `volume.json`: format version and persistent UUID, preserved when moved.
 - `settings.json`: JSON overrides for this volume; `{}` inherits user settings.
+- `workspace-state.json`: open file tabs, their order, active buffer and pane layout.
+- `viewer-state.json`: document pages, zoom and scroll positions when remembering is enabled.
+- `trash/`: deleted files and their restoration records.
 
 These files contain portable JSON without absolute machine paths. The file
 explorer hides `.enote`, and technical files cannot be opened or saved as notes.
 The application refuses unsupported manifest versions or linked technical files.
 Volume settings never modify user settings; switching volumes starts again from
-the global/user base. Window size, font size and panel settings apply immediately.
+the global/user base. Font size and panel settings apply immediately. Window
+geometry is restored from application state at startup and remains unchanged
+when switching volumes.
 
 The user configuration directory contains a separate `state.json` with the last
-successfully opened volume's path. eNote restores that volume at startup. With
-no remembered volume, or an unavailable one, it offers Create volume and Open
+successfully opened volume's path and the window's logical size/position. eNote
+restores both at startup. With no remembered volume, or an unavailable one, it offers Create volume and Open
 volume. Failed restoration reports an error without deleting the remembered path.
 Switching volumes requires confirmation for unsaved changes; cancellation or
-failure preserves the current buffers. Open-buffer restoration is not yet implemented.
+failure preserves the current buffers.
+
+Each volume saves open file tabs, the active buffer, pane arrangement and split
+ratios in `.enote/workspace-state.json`, using only relative document paths.
+Changes are saved in the background after a short delay, with a final flush on
+exit or volume switch. Missing or unavailable files are skipped during restoration;
+invalid state files are preserved. Session restoration reopens saved file contents;
+unsaved edits and untitled scratch buffers are not recovered.
+
+Drag tabs in the top strip to reorder them, into a pane to move the buffer,
+or to a pane edge to create a split. The tab order is included in the saved
+workspace. Drop hints indicate the selected target; Escape cancels the drag.
+
+Drag a pane by its title bar: drop in another pane's center to swap buffers, on a
+pane edge to rearrange the split, or on the workspace edge to move it there.
+Controls in the title bar remain clickable and are excluded from the drag region.
 
 Run the model and UI-state tests with `cargo test`.

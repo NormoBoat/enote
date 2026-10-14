@@ -12,7 +12,7 @@ use enote::buffer::{BufferContent, BufferId, Buffers, LoadedFile, MediaKind, Sav
 use enote::{
     file_ops::TrashRecord,
     reader::{ReaderStore, RenderedPage},
-    session::SessionStore,
+    session::{PaneLayout, SessionStore, WindowPlacement, WorkspaceSession},
     settings::{LoadedSettings, Settings},
     shortcuts::{Modifiers as ShortcutModifiers, ShortcutAction},
     volume::EntryKind,
@@ -29,7 +29,46 @@ use lucide_icons::Icon;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
+
+#[derive(Debug, Clone)]
+struct TabDrag {
+    serial: u64,
+    buffer: BufferId,
+    start: iced::Point,
+    moving: bool,
+}
+
+fn tab_drop_region(point: iced::Point, bounds: iced::Rectangle) -> pane_grid::Region {
+    let distances = [
+        (
+            (point.x - bounds.x) / bounds.width.max(1.0),
+            pane_grid::Edge::Left,
+        ),
+        (
+            (bounds.x + bounds.width - point.x) / bounds.width.max(1.0),
+            pane_grid::Edge::Right,
+        ),
+        (
+            (point.y - bounds.y) / bounds.height.max(1.0),
+            pane_grid::Edge::Top,
+        ),
+        (
+            (bounds.y + bounds.height - point.y) / bounds.height.max(1.0),
+            pane_grid::Edge::Bottom,
+        ),
+    ];
+    let (distance, edge) = distances
+        .into_iter()
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .unwrap();
+    if distance < 0.22 {
+        pane_grid::Region::Edge(edge)
+    } else {
+        pane_grid::Region::Center
+    }
+}
 
 #[derive(Debug, Clone)]
 struct EntryDraft {
@@ -69,6 +108,10 @@ pub struct Enote {
     settings: Settings,
     base_settings: LoadedSettings,
     session: Option<SessionStore>,
+    window_position: Option<[f32; 2]>,
+    session_pending: bool,
+    session_revision: u64,
+    session_io: Arc<Mutex<u64>>,
     volume: Option<VolumeStorage>,
     volume_loading: bool,
     creation_name: Option<String>,
@@ -95,6 +138,11 @@ pub struct Enote {
     importing: bool,
     import_errors: Vec<String>,
     active: Option<BufferId>,
+    tab_order: Vec<BufferId>,
+    tab_drag: Option<TabDrag>,
+    tab_drag_serial: u64,
+    tab_hover: Option<(BufferId, bool)>,
+    tab_pane_hover: Option<(pane_grid::Pane, pane_grid::Region)>,
     panes: pane_grid::State<Option<BufferId>>,
     focused_pane: pane_grid::Pane,
     resizing_sidebar: bool,
@@ -127,6 +175,15 @@ pub enum Message {
     FocusPane(pane_grid::Pane),
     ClosePane(pane_grid::Pane),
     ResizePane(pane_grid::ResizeEvent),
+    DragPane(pane_grid::DragEvent),
+    TabPointer(BufferId, Phase, iced::Point, iced::Rectangle),
+    PanePointer(pane_grid::Pane, Phase, iced::Point, iced::Rectangle),
+    EndTabDrag(u64),
+    WindowMoved(iced::Point),
+    WindowOpened(Option<iced::Point>, iced::Size),
+    RestoreReaders,
+    PersistSession,
+    SessionSaved(Result<(), String>),
     ResizeSidebar(Phase, iced::Point),
     ReaderPrefetched(BufferId, u64, Result<RenderedPage, String>),
     FileDropped(PathBuf),
@@ -206,6 +263,10 @@ impl Enote {
             resizing_sidebar: false,
             base_settings: LoadedSettings::from_settings(settings.clone()),
             session: None,
+            window_position: None,
+            session_pending: false,
+            session_revision: 0,
+            session_io: Arc::new(Mutex::new(0)),
             volume: None,
             volume_loading: false,
             creation_name: None,
@@ -232,6 +293,11 @@ impl Enote {
             importing: false,
             import_errors: Vec::new(),
             active: None,
+            tab_order: Vec::new(),
+            tab_drag: None,
+            tab_drag_serial: 0,
+            tab_hover: None,
+            tab_pane_hover: None,
             explorer: Explorer::default(),
             sidebar: settings.workspace.sidebar_visible,
             viewport_width: settings.window.width as f32,
@@ -255,13 +321,28 @@ impl Enote {
         if !startup.warnings.is_empty() {
             app.status = startup.warnings;
         }
+        if let Some(window) = startup.window {
+            app.viewport_width = window.width;
+            app.viewport_height = window.height;
+            app.window_position = window.position;
+        } else {
+            app.viewport_width = app.settings.window.width as f32;
+            app.viewport_height = app.settings.window.height as f32;
+        }
         app
+    }
+    pub fn startup_tasks(&mut self) -> Task<Message> {
+        Task::done(Message::RestoreReaders)
     }
     pub fn subscription(&self) -> Subscription<Message> {
         iced::event::listen_with(|event, _, _| match event {
             Event::Window(iced::window::Event::CloseRequested) => {
                 Some(Message::Close(CloseTarget::Window))
             }
+            Event::Window(iced::window::Event::Opened { position, size }) => {
+                Some(Message::WindowOpened(position, size))
+            }
+            Event::Window(iced::window::Event::Moved(point)) => Some(Message::WindowMoved(point)),
             Event::Window(iced::window::Event::Resized(size)) => Some(Message::Viewport(size)),
             Event::Window(iced::window::Event::FileDropped(path)) => {
                 Some(Message::FileDropped(path))
@@ -293,7 +374,39 @@ impl Enote {
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        self.sync_tab_order();
+        let persist = matches!(
+            &message,
+            Message::Opened(_)
+                | Message::Activate(_)
+                | Message::Close(_)
+                | Message::Discard
+                | Message::Saved(_)
+                | Message::FileCompleted(_)
+                | Message::EntryCreated(_)
+                | Message::Split(_)
+                | Message::SplitPane(_, _)
+                | Message::ClosePane(_)
+                | Message::FocusPane(_)
+                | Message::ResizePane(_)
+                | Message::DragPane(_)
+                | Message::TabPointer(_, Phase::Release, _, _)
+                | Message::PanePointer(_, Phase::Release, _, _)
+                | Message::NextTab
+                | Message::PreviousTab
+                | Message::Viewport(_)
+                | Message::WindowMoved(_)
+                | Message::WindowOpened(_, _)
+        );
         let task = self.update_inner(message);
+        self.sync_tab_order();
+        if self
+            .tab_drag
+            .as_ref()
+            .is_some_and(|drag| !self.buffers.entries.contains_key(&drag.buffer))
+        {
+            self.clear_tab_drag();
+        }
         for (_, buffer) in self.panes.iter_mut() {
             if buffer.is_some_and(|id| !self.buffers.entries.contains_key(&id)) {
                 *buffer = None;
@@ -311,7 +424,11 @@ impl Enote {
         if let Some(value) = self.panes.get_mut(self.focused_pane) {
             *value = self.active;
         }
-        task
+        if persist {
+            Task::batch([task, self.schedule_session_save()])
+        } else {
+            task
+        }
     }
 
     fn update_inner(&mut self, message: Message) -> Task<Message> {
@@ -330,6 +447,11 @@ impl Enote {
                     | Message::CancelFilePrompt
                     | Message::KeyPressed(_, _)
                     | Message::Viewport(_)
+                    | Message::WindowMoved(_)
+                    | Message::WindowOpened(_, _)
+                    | Message::PersistSession
+                    | Message::SessionSaved(_)
+                    | Message::RestoreReaders
                     | Message::CursorMoved(_)
                     | Message::ClearHover
                     | Message::Close(CloseTarget::Window)
@@ -338,6 +460,134 @@ impl Enote {
             return Task::none();
         }
         match message {
+            Message::TabPointer(id, phase, point, bounds)
+                if !self.busy && self.pending_close.is_none() && !self.volume_loading =>
+            {
+                match phase {
+                    Phase::Press => {
+                        self.clear_tab_drag();
+                        self.drag = None;
+                        self.tab_drag_serial += 1;
+                        self.tab_drag = Some(TabDrag {
+                            serial: self.tab_drag_serial,
+                            buffer: id,
+                            start: point,
+                            moving: false,
+                        });
+                    }
+                    Phase::Move => {
+                        if let Some(drag) = &mut self.tab_drag {
+                            drag.moving |= drag.start.distance(point) > 5.0;
+                            self.tab_hover = Some((id, point.x < bounds.center_x()));
+                            self.tab_pane_hover = None;
+                        }
+                    }
+                    Phase::Leave => {
+                        if self.tab_hover.is_some_and(|(target, _)| target == id) {
+                            self.tab_hover = None;
+                        }
+                    }
+                    Phase::Release => {
+                        if let Some(drag) = self.tab_drag.take() {
+                            let moving = drag.moving || drag.start.distance(point) > 5.0;
+                            self.clear_tab_drag();
+                            if moving {
+                                self.reorder_tab(drag.buffer, id, point.x < bounds.center_x());
+                            } else if drag.buffer == id {
+                                return self.update(Message::Activate(id));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Message::PanePointer(pane, phase, point, bounds) => {
+                if let Some(drag) = &mut self.tab_drag {
+                    drag.moving |= drag.start.distance(point) > 5.0;
+                    match phase {
+                        Phase::Move if drag.moving => {
+                            self.tab_hover = None;
+                            self.tab_pane_hover = Some((pane, tab_drop_region(point, bounds)));
+                        }
+                        Phase::Leave => {
+                            if self
+                                .tab_pane_hover
+                                .is_some_and(|(target, _)| target == pane)
+                            {
+                                self.tab_pane_hover = None;
+                            }
+                        }
+                        Phase::Release => {
+                            let buffer = drag.buffer;
+                            let moving = drag.moving;
+                            self.clear_tab_drag();
+                            if moving && self.pending_close.is_none() && !self.busy {
+                                return self.drop_tab(buffer, pane, tab_drop_region(point, bounds));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Message::PersistSession => {
+                self.session_pending = false;
+                return self.flush_session();
+            }
+            Message::SessionSaved(Err(error)) => self.status = error,
+            Message::WindowMoved(point) => {
+                if point.x.is_finite() && point.y.is_finite() {
+                    self.window_position = Some([point.x, point.y]);
+                }
+            }
+            Message::WindowOpened(position, size) => {
+                if let Some(point) = position {
+                    self.window_position = Some([point.x, point.y]);
+                }
+                return self.update_inner(Message::Viewport(size));
+            }
+            Message::RestoreReaders => {
+                let ids: Vec<_> = self
+                    .panes
+                    .iter()
+                    .filter_map(|(_, id)| *id)
+                    .filter(|id| self.readers.contains_key(id))
+                    .collect();
+                return Task::batch(ids.into_iter().map(|id| self.render_reader(id)));
+            }
+            Message::DragPane(event)
+                if self.pending_close.is_none()
+                    && !self.volume_loading
+                    && self.file_prompt.is_none() =>
+            {
+                match event {
+                    pane_grid::DragEvent::Picked { pane } => {
+                        if let Some(value) = self.panes.get(pane) {
+                            self.focused_pane = pane;
+                            self.active = *value;
+                        }
+                    }
+                    pane_grid::DragEvent::Dropped { pane, target } => {
+                        let valid_target = match target {
+                            pane_grid::Target::Pane(target, _) => {
+                                target != pane && self.panes.get(target).is_some()
+                            }
+                            pane_grid::Target::Edge(_) => true,
+                        };
+                        if self.panes.get(pane).is_some() && valid_target {
+                            let dragged = *self.panes.get(pane).unwrap();
+                            self.panes.drop(pane, target);
+                            self.active = dragged;
+                            self.focused_pane = self
+                                .panes
+                                .iter()
+                                .find_map(|(pane, value)| (*value == dragged).then_some(*pane))
+                                .unwrap_or(pane);
+                            return self.resize_readers();
+                        }
+                    }
+                    pane_grid::DragEvent::Canceled { .. } => {}
+                }
+            }
             Message::SplitPane(pane, axis) => {
                 if let Some(value) = self.panes.get(pane) {
                     self.focused_pane = pane;
@@ -420,11 +670,7 @@ impl Enote {
                             viewer.count = Some(page.count);
                             viewer.page_input = (page.page + 1).to_string();
                             viewer.image_ratio = page.height as f32 / page.width as f32;
-                            viewer.image = Some(image::Handle::from_rgba(
-                                page.width,
-                                page.height,
-                                page.rgba.to_vec(),
-                            ));
+                            viewer.image = Some(viewer.pages[&page.page].handle.clone());
                             viewer.error.clear();
                             if (viewer.display_width - available * viewer.position.zoom).abs() > 2.0
                             {
@@ -544,9 +790,13 @@ impl Enote {
                 self.hovered_folder = None;
                 self.hovered_target = None;
                 self.drag = None;
+                self.clear_tab_drag();
             }
             Message::CursorMoved(position) => {
                 self.cursor = position;
+                if let Some(drag) = &mut self.tab_drag {
+                    drag.moving |= drag.start.distance(position) > 5.0;
+                }
                 if self.resizing_sidebar {
                     return self.update_inner(Message::ResizeSidebar(Phase::Move, position));
                 }
@@ -600,6 +850,20 @@ impl Enote {
             Message::MouseUp => {
                 self.drag = None;
                 self.resizing_sidebar = false;
+                // Let widget release messages from this input batch resolve the
+                // drop before clearing a drag released outside any target.
+                if let Some(drag) = &self.tab_drag {
+                    return Task::done(Message::EndTabDrag(drag.serial));
+                }
+            }
+            Message::EndTabDrag(serial) => {
+                if self
+                    .tab_drag
+                    .as_ref()
+                    .is_some_and(|drag| drag.serial == serial)
+                {
+                    self.clear_tab_drag();
+                }
             }
             Message::ContextRequested(path, kind) if !self.busy && self.pending_close.is_none() => {
                 self.entry_draft = None;
@@ -759,6 +1023,9 @@ impl Enote {
                         ShortcutAction::NextTab => Message::NextTab,
                         ShortcutAction::PreviousTab => Message::PreviousTab,
                         ShortcutAction::ToggleSidebar => Message::ToggleSidebar,
+                        ShortcutAction::Cancel if self.tab_drag.is_some() => {
+                            Message::EndTabDrag(self.tab_drag.as_ref().unwrap().serial)
+                        }
                         ShortcutAction::Cancel if self.drag.is_some() => Message::MouseUp,
                         ShortcutAction::Cancel if self.context_menu.is_some() => {
                             Message::DismissContext
@@ -861,7 +1128,7 @@ impl Enote {
             Message::NextTab | Message::PreviousTab
                 if self.pending_close.is_none() && !self.volume_loading =>
             {
-                let ids: Vec<_> = self.buffers.entries.keys().copied().collect();
+                let ids = self.tab_order.clone();
                 if !ids.is_empty() {
                     let current = self
                         .active
@@ -901,7 +1168,7 @@ impl Enote {
                 {
                     self.pending_close = Some(CloseTarget::SwitchVolume(action));
                 } else {
-                    return self.begin_volume(action);
+                    return self.flush_session().chain(self.begin_volume(action));
                 }
             }
             Message::CreateName(name) if self.creation_name.is_some() && !self.busy => {
@@ -934,25 +1201,20 @@ impl Enote {
                 if let Some(result) = result {
                     match result.and_then(|volume| self.apply_volume(volume)) {
                         Ok(()) => {
-                            let size = iced::Size::new(
-                                self.settings.window.width as f32,
-                                self.settings.window.height as f32,
-                            );
-                            let resize = iced::window::latest()
-                                .and_then(move |window| iced::window::resize(window, size));
+                            let restore = Task::done(Message::RestoreReaders);
                             if let Some(session) = self.session.clone() {
                                 self.busy = true;
                                 self.volume_loading = true;
                                 let root = self.volume.as_ref().unwrap().root.clone();
                                 return Task::batch([
-                                    resize,
+                                    restore,
                                     Task::perform(
                                         async move { session.remember(&root) },
                                         Message::Remembered,
                                     ),
                                 ]);
                             }
-                            return resize;
+                            return restore;
                         }
                         Err(error) => self.status = error,
                     }
@@ -1579,9 +1841,17 @@ impl Enote {
     }
 
     fn apply_volume(&mut self, volume: OpenedVolume) -> Result<(), String> {
+        let workspace = volume.workspace;
+        let restored_files = volume.restored_files;
         self.last_deleted = volume.trash.clone();
         let mut buffers = Buffers::default();
         buffers.mount(&volume.storage.root)?;
+        let mut restored_ids = BTreeMap::new();
+        for (index, file) in restored_files {
+            if let Ok(id) = buffers.insert(file) {
+                restored_ids.insert(index, id);
+            }
+        }
         self.settings = volume.settings.settings;
         self.status = volume
             .settings
@@ -1591,8 +1861,7 @@ impl Enote {
             .collect::<Vec<_>>()
             .join("\n");
         self.sidebar = self.settings.workspace.sidebar_visible;
-        self.viewport_width = self.settings.window.width as f32;
-        self.viewport_height = self.settings.window.height as f32;
+
         self.buffers = buffers;
         self.editors.clear();
         self.images.clear();
@@ -1605,6 +1874,8 @@ impl Enote {
             }
         };
         self.active = None;
+        self.clear_tab_drag();
+        self.tab_order = restored_ids.values().copied().collect();
         (self.panes, self.focused_pane) = pane_grid::State::new(None);
         self.explorer.set_root(volume.directory);
         self.volume = Some(volume.storage);
@@ -1618,7 +1889,279 @@ impl Enote {
         self.file_prompt = None;
         self.hovered_target = None;
         self.drag = None;
+        self.restore_workspace(workspace, &restored_ids);
         Ok(())
+    }
+
+    fn restore_workspace(&mut self, workspace: WorkspaceSession, ids: &BTreeMap<usize, BufferId>) {
+        fn configuration(
+            layout: PaneLayout,
+            ids: &BTreeMap<usize, BufferId>,
+        ) -> pane_grid::Configuration<Option<BufferId>> {
+            match layout {
+                PaneLayout::Pane { tab } => {
+                    pane_grid::Configuration::Pane(tab.and_then(|index| ids.get(&index).copied()))
+                }
+                PaneLayout::Split {
+                    vertical,
+                    ratio,
+                    a,
+                    b,
+                } => pane_grid::Configuration::Split {
+                    axis: if vertical {
+                        pane_grid::Axis::Vertical
+                    } else {
+                        pane_grid::Axis::Horizontal
+                    },
+                    ratio,
+                    a: Box::new(configuration(*a, ids)),
+                    b: Box::new(configuration(*b, ids)),
+                },
+            }
+        }
+        for (&id, buffer) in &self.buffers.entries {
+            if let Some(text) = buffer.text() {
+                self.editors
+                    .insert(id, text_editor::Content::with_text(text));
+            }
+            if let BufferContent::Media {
+                kind,
+                bytes: Some(bytes),
+                ..
+            } = &buffer.content
+            {
+                match kind {
+                    MediaKind::Image => {
+                        self.images
+                            .insert(id, image::Handle::from_bytes(bytes.to_vec()));
+                    }
+                    MediaKind::Document => {
+                        let position = if self.settings.viewer.remember_position {
+                            buffer
+                                .source
+                                .as_ref()
+                                .and_then(|source| self.buffers.path(source).ok())
+                                .and_then(|path| {
+                                    self.reader_store
+                                        .as_ref()
+                                        .and_then(|store| store.position(&path).ok())
+                                })
+                                .unwrap_or_default()
+                        } else {
+                            Default::default()
+                        };
+                        self.readers.insert(id, Viewer::new(position));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.panes = pane_grid::State::with_configuration(configuration(workspace.layout, ids));
+        self.active = workspace.active.and_then(|index| ids.get(&index).copied());
+        if workspace.active.is_some() && self.active.is_none() {
+            self.active = ids.values().next().copied();
+        }
+        self.focused_pane = self
+            .panes
+            .iter()
+            .find_map(|(pane, value)| (*value == self.active).then_some(*pane))
+            .unwrap_or_else(|| *self.panes.iter().next().unwrap().0);
+        *self.panes.get_mut(self.focused_pane).unwrap() = self.active;
+    }
+
+    fn sync_tab_order(&mut self) {
+        self.tab_order
+            .retain(|id| self.buffers.entries.contains_key(id));
+        for id in self.buffers.entries.keys() {
+            if !self.tab_order.contains(id) {
+                self.tab_order.push(*id);
+            }
+        }
+    }
+
+    fn clear_tab_drag(&mut self) {
+        self.tab_drag = None;
+        self.tab_hover = None;
+        self.tab_pane_hover = None;
+    }
+
+    fn reorder_tab(&mut self, source: BufferId, target: BufferId, before: bool) {
+        if source == target || !self.tab_order.contains(&target) {
+            return;
+        }
+        let Some(from) = self.tab_order.iter().position(|id| *id == source) else {
+            return;
+        };
+        self.tab_order.remove(from);
+        let to = self.tab_order.iter().position(|id| *id == target).unwrap() + usize::from(!before);
+        self.tab_order.insert(to, source);
+    }
+
+    fn drop_tab(
+        &mut self,
+        buffer: BufferId,
+        target: pane_grid::Pane,
+        region: pane_grid::Region,
+    ) -> Task<Message> {
+        if !self.buffers.entries.contains_key(&buffer) || self.panes.get(target).is_none() {
+            return Task::none();
+        }
+        let source = self
+            .panes
+            .iter()
+            .find_map(|(pane, value)| (*value == Some(buffer)).then_some(*pane));
+        match region {
+            pane_grid::Region::Center => {
+                let displaced = *self.panes.get(target).unwrap();
+                if let Some(source) = source
+                    && source != target
+                {
+                    *self.panes.get_mut(source).unwrap() = displaced;
+                }
+                *self.panes.get_mut(target).unwrap() = Some(buffer);
+                self.focused_pane = target;
+            }
+            pane_grid::Region::Edge(edge) => {
+                if let Some(source) = source
+                    && source != target
+                {
+                    self.panes
+                        .drop(source, pane_grid::Target::Pane(target, region));
+                    self.focused_pane = source;
+                } else {
+                    let axis = match edge {
+                        pane_grid::Edge::Left | pane_grid::Edge::Right => pane_grid::Axis::Vertical,
+                        _ => pane_grid::Axis::Horizontal,
+                    };
+                    if self.panes.len() >= 64 {
+                        return Task::none();
+                    }
+                    let Some((new, _)) = self.panes.split(axis, target, Some(buffer)) else {
+                        return Task::none();
+                    };
+                    if source == Some(target) {
+                        *self.panes.get_mut(target).unwrap() = None;
+                    }
+                    if matches!(edge, pane_grid::Edge::Left | pane_grid::Edge::Top) {
+                        self.panes.swap(new, target);
+                    }
+                    self.focused_pane = new;
+                }
+            }
+        }
+        self.active = Some(buffer);
+        Task::batch([self.resize_readers(), self.show_reader(buffer)])
+    }
+
+    fn workspace_snapshot(&self) -> WorkspaceSession {
+        let mut tabs = Vec::new();
+        let mut indices = BTreeMap::new();
+        for &id in &self.tab_order {
+            let Some(buffer) = self.buffers.entries.get(&id) else {
+                continue;
+            };
+            if let Some(source) = &buffer.source {
+                indices.insert(id, tabs.len());
+                tabs.push(source.path.clone());
+            }
+        }
+        fn layout(
+            node: &pane_grid::Node,
+            panes: &pane_grid::State<Option<BufferId>>,
+            indices: &BTreeMap<BufferId, usize>,
+        ) -> PaneLayout {
+            match node {
+                pane_grid::Node::Pane(pane) => PaneLayout::Pane {
+                    tab: panes
+                        .get(*pane)
+                        .copied()
+                        .flatten()
+                        .and_then(|id| indices.get(&id).copied()),
+                },
+                pane_grid::Node::Split {
+                    axis, ratio, a, b, ..
+                } => PaneLayout::Split {
+                    vertical: *axis == pane_grid::Axis::Vertical,
+                    ratio: *ratio,
+                    a: Box::new(layout(a, panes, indices)),
+                    b: Box::new(layout(b, panes, indices)),
+                },
+            }
+        }
+        WorkspaceSession {
+            version: 1,
+            tabs,
+            active: self.active.and_then(|id| indices.get(&id).copied()),
+            layout: layout(self.panes.layout(), &self.panes, &indices),
+        }
+    }
+
+    fn schedule_session_save(&mut self) -> Task<Message> {
+        if self.session_pending || (self.session.is_none() && self.volume.is_none()) {
+            return Task::none();
+        }
+        self.session_pending = true;
+        let (send, receive) = iced::futures::channel::oneshot::channel();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let _ = send.send(());
+        });
+        Task::perform(
+            async move {
+                let _ = receive.await;
+            },
+            |_| Message::PersistSession,
+        )
+    }
+
+    fn flush_session(&mut self) -> Task<Message> {
+        let root = self.volume.as_ref().map(|volume| volume.root.clone());
+        let workspace = self.workspace_snapshot();
+        let window = WindowPlacement {
+            width: self.viewport_width,
+            height: self.viewport_height,
+            position: self.window_position,
+        };
+        let session = self.session.clone();
+        self.session_revision += 1;
+        let revision = self.session_revision;
+        let io = self.session_io.clone();
+        let (send, receive) = iced::futures::channel::oneshot::channel();
+        std::thread::spawn(move || {
+            let save = || -> Result<(), String> {
+                let mut latest = io.lock().map_err(|_| "Session state lock poisoned")?;
+                if revision < *latest {
+                    return Ok(());
+                }
+                *latest = revision;
+                let mut errors = Vec::new();
+                if let Some(root) = root
+                    && let Err(error) = workspace.save(&root)
+                {
+                    errors.push(error);
+                }
+                if window.valid()
+                    && let Some(session) = session
+                    && let Err(error) = session.remember_window(&window)
+                {
+                    errors.push(error);
+                }
+                if errors.is_empty() {
+                    Ok(())
+                } else {
+                    Err(errors.join("\n"))
+                }
+            };
+            let _ = send.send(save());
+        });
+        Task::perform(
+            async move {
+                receive
+                    .await
+                    .unwrap_or_else(|_| Err("Session save stopped".into()))
+            },
+            Message::SessionSaved,
+        )
     }
 
     fn reader_width(&self) -> f32 {
@@ -1652,13 +2195,19 @@ impl Enote {
     }
 
     fn resize_readers(&mut self) -> Task<Message> {
-        let ids: Vec<_> = self.readers.keys().copied().collect();
+        let ids: Vec<_> = self
+            .panes
+            .iter()
+            .filter_map(|(_, id)| *id)
+            .filter(|id| self.readers.contains_key(id))
+            .collect();
         let mut tasks = Vec::new();
         for id in ids {
             let width = self.reader_width_for(id);
             let viewer = self.readers.get_mut(&id).unwrap();
             viewer.keep_scroll = false;
-            if !viewer.loading && (viewer.display_width - width * viewer.position.zoom).abs() > 2.0
+            if viewer.image.is_none()
+                || (viewer.display_width - width * viewer.position.zoom).abs() > 2.0
             {
                 tasks.push(self.render_reader(id));
             }
@@ -1693,31 +2242,54 @@ impl Enote {
         self.reader_request += 1;
         let request = self.reader_request;
         viewer.request = request;
-        viewer.loading = true;
         viewer.restoring = !viewer.keep_scroll;
         viewer.error.clear();
         viewer.display_width = available * viewer.position.zoom;
+        // Reuse a nearby raster size during small resizes; image layout stays exact.
+        viewer.pixel_width =
+            ((viewer.display_width * 2.0 / 64.0).ceil() * 64.0).clamp(256.0, 2400.0);
         viewer.page_window =
-            ((self.viewport_height / viewer.slot_height()).ceil() as u32 + 1).clamp(2, 12);
+            ((self.viewport_height / viewer.slot_height()).ceil() as u32 + 3).clamp(4, 12);
         let page = viewer.position.page;
-        let pixel_width = viewer.display_width * 2.0;
+        let pixel_width = viewer.pixel_width;
+        viewer.loading = viewer.cached_page(page).is_none();
+        let worker = viewer
+            .worker
+            .get_or_insert_with(|| enote::reader::RenderWorker::new(bytes, extension));
+        worker.set_generation(request);
+        let mut candidates = vec![page];
+        // Visible/forward pages first, then a small buffer behind the viewport.
+        candidates.extend(page.saturating_add(1)..page.saturating_add(viewer.page_window));
+        candidates.extend((page.saturating_sub(2)..page).rev());
         let mut tasks = Vec::new();
-        for candidate in page.saturating_sub(1)..page.saturating_add(viewer.page_window) {
+        for candidate in candidates {
             if viewer.count.is_some_and(|count| candidate >= count) {
                 continue;
             }
-            let bytes = bytes.clone();
-            let extension = extension.clone();
-            tasks.push(Task::perform(
-                async move { enote::reader::render(&bytes, &extension, candidate, pixel_width) },
-                move |result| {
-                    if candidate == page {
-                        Message::ReaderRendered(id, request, result)
-                    } else {
-                        Message::ReaderPrefetched(id, request, result)
-                    }
-                },
-            ));
+            let cached = viewer.cached_page(candidate).cloned();
+            if candidate == page {
+                if let Some(cached) = cached {
+                    tasks.push(Task::done(Message::ReaderRendered(id, request, Ok(cached))));
+                } else {
+                    tasks.push(Task::perform(
+                        viewer
+                            .worker
+                            .as_ref()
+                            .unwrap()
+                            .render(request, candidate, pixel_width),
+                        move |result| Message::ReaderRendered(id, request, result),
+                    ));
+                }
+            } else if cached.is_none() {
+                tasks.push(Task::perform(
+                    viewer
+                        .worker
+                        .as_ref()
+                        .unwrap()
+                        .render(request, candidate, pixel_width),
+                    move |result| Message::ReaderPrefetched(id, request, result),
+                ));
+            }
         }
         Task::batch(tasks)
     }
@@ -1725,8 +2297,10 @@ impl Enote {
     fn show_reader(&mut self, id: BufferId) -> Task<Message> {
         if self.readers.get(&id).is_some_and(|viewer| {
             !viewer.loading
-                && (viewer.display_width - self.reader_width_for(id) * viewer.position.zoom).abs()
-                    > 2.0
+                && (viewer.image.is_none()
+                    || (viewer.display_width - self.reader_width_for(id) * viewer.position.zoom)
+                        .abs()
+                        > 2.0)
         }) {
             self.readers.get_mut(&id).unwrap().keep_scroll = false;
             self.render_reader(id)
@@ -1826,7 +2400,6 @@ impl Enote {
                     0.0
                 };
                 viewer.page_input = (page + 1).to_string();
-                let loading = viewer.loading;
                 viewer.keep_scroll = true;
                 let normalized = ReaderAction::Scroll {
                     request,
@@ -1834,14 +2407,14 @@ impl Enote {
                     y: viewer.position.y,
                 };
                 let save = self.reader_action(id, normalized);
-                return if changed && !loading {
+                return if changed {
                     Task::batch([save, self.render_reader(id)])
                 } else {
                     save
                 };
             }
             ReaderAction::Scroll { request, x, y } => {
-                if viewer.request == request && !viewer.loading && !viewer.restoring {
+                if viewer.request == request && !viewer.restoring {
                     // An axis without overflow has a 0/0 relative offset in iced.
                     viewer.position.x = if x.is_finite() {
                         x.clamp(0.0, 1.0)
@@ -1864,7 +2437,6 @@ impl Enote {
                 return Task::none();
             }
             ReaderAction::Retry => {}
-            _ if viewer.loading => return Task::none(),
             ReaderAction::Previous => {
                 if viewer.position.page == 0 {
                     return Task::none();
@@ -1928,9 +2500,12 @@ impl Enote {
 
     fn close(&mut self, target: CloseTarget) -> Task<Message> {
         match target {
-            CloseTarget::Window => self.flush_readers().chain(iced::exit()),
+            CloseTarget::Window => self
+                .flush_session()
+                .chain(self.flush_readers())
+                .chain(iced::exit()),
             CloseTarget::SwitchVolume(action) => {
-                let flush = self.flush_readers();
+                let flush = self.flush_session().chain(self.flush_readers());
                 flush.chain(self.begin_volume(action))
             }
             CloseTarget::Buffer(id) => {
@@ -1960,33 +2535,54 @@ impl Enote {
         }
         let mut workspace = column![];
         if !self.buffers.entries.is_empty() {
-            let tabs = row(self.buffers.entries.values().map(|buffer| {
-                let active = self.active == Some(buffer.id);
-                let label = format!(
-                    "{}{}",
-                    buffer.name(),
-                    if buffer.modified() { " *" } else { "" }
-                );
-                row![
-                    button(text(label).size(12))
+            let tabs = row(self
+                .tab_order
+                .iter()
+                .filter_map(|id| self.buffers.entries.get(id))
+                .map(|buffer| {
+                    let id = buffer.id;
+                    let active = self.active == Some(id);
+                    let label = format!(
+                        "{}{}",
+                        buffer.name(),
+                        if buffer.modified() { " *" } else { "" }
+                    );
+                    let dragging = self.tab_drag.as_ref().is_some_and(|drag| drag.moving);
+                    let indicator = |before| {
+                        container(Space::new().width(2).height(22)).style(move |_| {
+                            look::surface(if dragging && self.tab_hover == Some((id, before)) {
+                                look::MUTED
+                            } else {
+                                look::CANVAS
+                            })
+                        })
+                    };
+                    let label = container(text(label).size(12))
                         .padding([7, 12])
-                        .style(if active { look::selected } else { look::quiet })
-                        .on_press_maybe(
-                            self.pending_close
-                                .is_none()
-                                .then_some(Message::Activate(buffer.id))
+                        .style(move |_| {
+                            look::surface(if active { look::PANEL } else { look::CANVAS })
+                        });
+                    row![
+                        indicator(true),
+                        DragArea::with_bounds(
+                            label,
+                            iced::mouse::Interaction::Grab,
+                            move |phase, point, bounds| Message::TabPointer(
+                                id, phase, point, bounds
+                            )
                         ),
-                    self.tool(
-                        Icon::X,
-                        "Close",
-                        Message::Close(CloseTarget::Buffer(buffer.id)),
-                        !self.busy
-                    ),
-                ]
-                .spacing(0)
-                .align_y(iced::Center)
-                .into()
-            }))
+                        self.tool(
+                            Icon::X,
+                            "Close",
+                            Message::Close(CloseTarget::Buffer(id)),
+                            !self.busy
+                        ),
+                        indicator(false),
+                    ]
+                    .spacing(0)
+                    .align_y(iced::Center)
+                    .into()
+                }))
             .spacing(4)
             .padding([4, 8]);
             let writable = self
@@ -2061,20 +2657,7 @@ impl Enote {
                     .and_then(|id| self.buffers.entries.get(&id))
                     .map(|b| b.name())
                     .unwrap_or_default();
-                let header = row![
-                    button(
-                        text(label)
-                            .size(11)
-                            .width(Fill)
-                            .wrapping(iced::widget::text::Wrapping::None)
-                    )
-                    .style(if pane == self.focused_pane {
-                        look::selected
-                    } else {
-                        look::quiet
-                    })
-                    .width(Fill)
-                    .on_press(Message::FocusPane(pane)),
+                let controls = row![
                     self.tool(
                         Icon::Columns2,
                         "Split right",
@@ -2095,19 +2678,70 @@ impl Enote {
                     ),
                 ]
                 .align_y(iced::Center);
-                pane_grid::Content::new(column![header, self.buffer_view_for(*buffer)].height(Fill))
+                let header = pane_grid::TitleBar::new(
+                    container(
+                        text(label)
+                            .size(11)
+                            .wrapping(iced::widget::text::Wrapping::None),
+                    )
+                    .padding([4, 8])
+                    .width(Fill),
+                )
+                .controls(pane_grid::Controls::new(controls))
+                .always_show_controls()
+                .style(move |_| {
+                    look::surface(if pane == self.focused_pane {
+                        look::PANEL
+                    } else {
+                        look::CANVAS
+                    })
+                });
+                let body = self.buffer_view_for(*buffer);
+                let dragging = self.tab_drag.as_ref().is_some_and(|drag| drag.moving);
+                let body: Element<'_, Message> = if dragging {
+                    DragArea::drop_target(body, move |phase, point, bounds| {
+                        Message::PanePointer(pane, phase, point, bounds)
+                    })
+                    .into()
+                } else {
+                    DragArea::observe(body, move |phase, point, bounds| {
+                        Message::PanePointer(pane, phase, point, bounds)
+                    })
+                    .into()
+                };
+                let body: Element<'_, Message> = if let Some((target, region)) =
+                    self.tab_pane_hover.filter(|(target, _)| *target == pane)
+                {
+                    let _ = target;
+                    let hint = match region {
+                        pane_grid::Region::Center => "Move tab here",
+                        pane_grid::Region::Edge(pane_grid::Edge::Left) => "Split left",
+                        pane_grid::Region::Edge(pane_grid::Edge::Right) => "Split right",
+                        pane_grid::Region::Edge(pane_grid::Edge::Top) => "Split above",
+                        pane_grid::Region::Edge(pane_grid::Edge::Bottom) => "Split below",
+                    };
+                    stack![
+                        body,
+                        container(
+                            container(text(hint).size(13))
+                                .padding(12)
+                                .style(look::popup)
+                        )
+                        .center(Fill)
+                    ]
+                    .into()
+                } else {
+                    body
+                };
+                pane_grid::Content::new(body).title_bar(header)
             })
             .spacing(4)
             .on_click(Message::FocusPane)
+            .on_drag(Message::DragPane)
             .min_size(100)
             .on_resize(6, Message::ResizePane)
             .height(Fill),
         ));
-        if !self.status.is_empty() {
-            workspace = workspace
-                .push(container(text(&self.status).size(12).color(look::MUTED)).padding([8, 16]));
-        }
-
         let narrow = self.viewport_width < 600.0;
         let show_sidebar = self.sidebar && (!narrow || self.pending_close.is_none());
         let mut layout = row![];
@@ -2152,6 +2786,26 @@ impl Enote {
 
     fn file_overlays<'a>(&'a self, base: Element<'a, Message>) -> Element<'a, Message> {
         let mut layers = stack![base];
+        if let Some(drag) = &self.tab_drag
+            && drag.moving
+            && let Some(buffer) = self.buffers.entries.get(&drag.buffer)
+        {
+            layers = layers.push(
+                container(
+                    container(text(buffer.name()).size(12))
+                        .padding(8)
+                        .width(190)
+                        .style(look::popup),
+                )
+                .width(Fill)
+                .height(Fill)
+                .padding(iced::Padding {
+                    left: (self.cursor.x + 12.0).clamp(0.0, (self.viewport_width - 198.0).max(0.0)),
+                    top: (self.cursor.y + 12.0).clamp(0.0, (self.viewport_height - 52.0).max(0.0)),
+                    ..Default::default()
+                }),
+            );
+        }
         if let Some(drag) = &self.drag
             && drag.moving
         {
@@ -2935,7 +3589,7 @@ mod tests {
             include_bytes!("../tests/fixtures/reader.pdf"),
             "pdf",
             viewer.position.page,
-            viewer.display_width * 2.0,
+            viewer.pixel_width,
         );
         let _ = app.update(Message::ReaderRendered(id, request, result));
         let _ = app.update(Message::ReaderRestored(id, request));
@@ -3000,6 +3654,268 @@ mod tests {
         );
     }
 
+    fn open_two_tab_fixture(app: &mut Enote, root: &Path) -> (BufferId, BufferId) {
+        let _ = app.update(Message::Opened(Some(LoadedFile::read(
+            &root.join("A/nested/note.mde"),
+        ))));
+        let first = app.active.unwrap();
+        let other = root.join("other.mde");
+        std::fs::write(&other, "Other tab").unwrap();
+        let _ = app.update(Message::Opened(Some(LoadedFile::read(&other))));
+        (first, app.active.unwrap())
+    }
+
+    #[test]
+    fn tabs_reorder_from_pointer_release_and_restore_the_new_order() {
+        let (_dir, mut app, root) = file_fixture();
+        let (first, second) = open_two_tab_fixture(&mut app, &root);
+        let start = iced::Point::new(20.0, 15.0);
+        let bounds =
+            iced::Rectangle::new(iced::Point::new(120.0, 0.0), iced::Size::new(100.0, 30.0));
+        let _ = app.update(Message::TabPointer(first, Phase::Press, start, bounds));
+        // No intermediate move message: a batched release must still be a drag.
+        let _ = app.update(Message::TabPointer(
+            second,
+            Phase::Release,
+            iced::Point::new(210.0, 15.0),
+            bounds,
+        ));
+        assert_eq!(app.tab_order, vec![second, first]);
+        assert!(app.tab_drag.is_none());
+        let snapshot = app.workspace_snapshot();
+        snapshot.save(&root).unwrap();
+        app.apply_volume(OpenedVolume::open(&root, &app.base_settings).unwrap())
+            .unwrap();
+        assert_eq!(app.workspace_snapshot(), snapshot);
+        let _ = app.update(Message::NextTab);
+        assert_eq!(app.buffers.entries[&app.active.unwrap()].name(), "note.mde");
+    }
+
+    #[test]
+    fn dragging_a_hidden_tab_to_a_pane_edge_creates_a_split_and_preserves_edits() {
+        let (_dir, mut app, root) = file_fixture();
+        let (first, second) = open_two_tab_fixture(&mut app, &root);
+        app.buffers
+            .entries
+            .get_mut(&first)
+            .unwrap()
+            .set_text("Unsaved tab content".into());
+        let target = app.focused_pane;
+        let bounds =
+            iced::Rectangle::new(iced::Point::new(0.0, 50.0), iced::Size::new(600.0, 500.0));
+        let _ = app.update(Message::TabPointer(
+            first,
+            Phase::Press,
+            iced::Point::new(20.0, 15.0),
+            bounds,
+        ));
+        let _ = app.update(Message::PanePointer(
+            target,
+            Phase::Release,
+            iced::Point::new(590.0, 250.0),
+            bounds,
+        ));
+        assert_eq!(app.panes.len(), 2);
+        assert_eq!(*app.panes.get(target).unwrap(), Some(second));
+        assert_eq!(*app.panes.get(app.focused_pane).unwrap(), Some(first));
+        assert_eq!(app.active, Some(first));
+        assert_eq!(
+            app.buffers.entries[&first].text(),
+            Some("Unsaved tab content")
+        );
+        assert!(app.buffers.entries[&first].modified());
+    }
+
+    #[test]
+    fn dropping_visible_tab_in_another_pane_moves_it_without_duplicating_buffers() {
+        let (_dir, mut app, root) = file_fixture();
+        let (first, second) = open_two_tab_fixture(&mut app, &root);
+        let original = app.focused_pane;
+        let _ = app.update(Message::Split(pane_grid::Axis::Vertical));
+        let target = app.focused_pane;
+        assert_eq!(*app.panes.get(target).unwrap(), Some(first));
+        let bounds =
+            iced::Rectangle::new(iced::Point::new(0.0, 50.0), iced::Size::new(600.0, 500.0));
+        let _ = app.update(Message::TabPointer(
+            second,
+            Phase::Press,
+            iced::Point::new(20.0, 15.0),
+            bounds,
+        ));
+        let _ = app.update(Message::PanePointer(
+            target,
+            Phase::Release,
+            bounds.center(),
+            bounds,
+        ));
+        assert_eq!(*app.panes.get(target).unwrap(), Some(second));
+        assert_eq!(*app.panes.get(original).unwrap(), Some(first));
+        assert_eq!(app.buffers.entries.len(), 2);
+    }
+
+    #[test]
+    fn tab_click_activates_and_release_outside_targets_cancels_drag() {
+        let (_dir, mut app, root) = file_fixture();
+        let (first, second) = open_two_tab_fixture(&mut app, &root);
+        let point = iced::Point::new(20.0, 15.0);
+        let bounds = iced::Rectangle::new(iced::Point::ORIGIN, iced::Size::new(100.0, 30.0));
+        let _ = app.update(Message::TabPointer(first, Phase::Press, point, bounds));
+        let _ = app.update(Message::TabPointer(first, Phase::Release, point, bounds));
+        assert_eq!(app.active, Some(first));
+        let _ = app.update(Message::TabPointer(second, Phase::Press, point, bounds));
+        let _ = app.update(Message::CursorMoved(iced::Point::new(600.0, 600.0)));
+        let _ = app.update(Message::MouseUp);
+        let _ = app.update(Message::EndTabDrag(app.tab_drag_serial));
+        assert!(app.tab_drag.is_none());
+        assert_eq!(app.tab_order, vec![first, second]);
+        assert_eq!(app.panes.len(), 1);
+    }
+
+    #[test]
+    fn dragging_panes_swaps_and_repositions_buffers_without_losing_edits() {
+        let (_dir, mut app, root) = file_fixture();
+        let note = root.join("A/nested/note.mde");
+        let _ = app.update(Message::Opened(Some(LoadedFile::read(&note))));
+        let first_id = app.active.unwrap();
+        let first_pane = app.focused_pane;
+        edit(&mut app, 'x');
+        let unsaved = app.buffers.entries[&first_id].text().unwrap().to_owned();
+        let _ = app.update(Message::Split(pane_grid::Axis::Vertical));
+        let second_pane = app.focused_pane;
+        let other = root.join("second.mde");
+        std::fs::write(&other, "Second buffer").unwrap();
+        let _ = app.update(Message::Opened(Some(LoadedFile::read(&other))));
+        let second_id = app.active.unwrap();
+        let _ = app.update(Message::DragPane(pane_grid::DragEvent::Dropped {
+            pane: first_pane,
+            target: pane_grid::Target::Pane(second_pane, pane_grid::Region::Center),
+        }));
+        assert_eq!(*app.panes.get(first_pane).unwrap(), Some(first_id));
+        assert_eq!(*app.panes.get(second_pane).unwrap(), Some(second_id));
+        assert_eq!(app.active, Some(first_id));
+        assert_eq!(app.focused_pane, first_pane);
+        let PaneLayout::Split { a, b, .. } = app.workspace_snapshot().layout else {
+            panic!("Expected split");
+        };
+        assert_eq!(*a, PaneLayout::Pane { tab: Some(1) });
+        assert_eq!(*b, PaneLayout::Pane { tab: Some(0) });
+        let _ = app.update(Message::DragPane(pane_grid::DragEvent::Dropped {
+            pane: first_pane,
+            target: pane_grid::Target::Pane(
+                second_pane,
+                pane_grid::Region::Edge(pane_grid::Edge::Bottom),
+            ),
+        }));
+        assert!(matches!(
+            app.workspace_snapshot().layout,
+            PaneLayout::Split {
+                vertical: false,
+                ..
+            }
+        ));
+        assert_eq!(
+            app.buffers.entries[&first_id].text(),
+            Some(unsaved.as_str())
+        );
+        assert!(app.buffers.entries[&first_id].modified());
+        let layout = app.workspace_snapshot().layout;
+        let _ = app.update(Message::DragPane(pane_grid::DragEvent::Canceled {
+            pane: second_pane,
+        }));
+        assert_eq!(app.workspace_snapshot().layout, layout);
+    }
+
+    #[test]
+    fn volume_restores_tabs_active_buffer_layout_and_reader_position() {
+        let (_dir, mut app, root) = file_fixture();
+        let pdf = open_test_reader(&mut app, &root);
+        let _ = app.update(Message::Reader(pdf, ReaderAction::Next));
+        finish_test_render(&mut app, pdf);
+        app.reader_store.as_ref().unwrap().flush().unwrap();
+        let _ = app.update(Message::Split(pane_grid::Axis::Vertical));
+        let note = root.join("A/nested/note.mde");
+        let _ = app.update(Message::Opened(Some(LoadedFile::read(&note))));
+        let snapshot = app.workspace_snapshot();
+        snapshot.save(&root).unwrap();
+        let opened = OpenedVolume::open(&root, &app.base_settings).unwrap();
+        let mut restored = Enote::default();
+        restored.apply_volume(opened).unwrap();
+        assert_eq!(restored.workspace_snapshot(), snapshot);
+        assert_eq!(
+            restored.buffers.entries[&restored.active.unwrap()].name(),
+            "note.mde"
+        );
+        assert_eq!(restored.panes.len(), 2);
+        let pdf = restored.readers.keys().next().copied().unwrap();
+        assert_eq!(restored.readers[&pdf].position.page, 1);
+        let _ = restored.update(Message::Close(CloseTarget::Buffer(
+            restored.active.unwrap(),
+        )));
+        restored.workspace_snapshot().save(&root).unwrap();
+        restored
+            .apply_volume(OpenedVolume::open(&root, &restored.base_settings).unwrap())
+            .unwrap();
+        assert_eq!(restored.buffers.entries.len(), 1);
+        assert!(restored.editors.is_empty());
+    }
+
+    #[test]
+    fn startup_restores_window_geometry_and_the_saved_volume_workspace() {
+        let (dir, mut app, root) = file_fixture();
+        let path = root.join("A/nested/note.mde");
+        let _ = app.update(Message::Opened(Some(LoadedFile::read(&path))));
+        let snapshot = app.workspace_snapshot();
+        snapshot.save(&root).unwrap();
+        let paths = enote::settings::SettingsPaths {
+            global: dir.path().join("global.json"),
+            user: dir.path().join("config/settings.json"),
+        };
+        let session = SessionStore::new(&paths);
+        session.remember(&root).unwrap();
+        session
+            .remember_window(&WindowPlacement {
+                width: 1210.0,
+                height: 810.0,
+                position: Some([42.0, 63.0]),
+            })
+            .unwrap();
+        let restored = Enote::from_startup(Startup::load(paths));
+        assert_eq!(restored.workspace_snapshot(), snapshot);
+        assert_eq!(
+            (restored.viewport_width, restored.viewport_height),
+            (1210.0, 810.0)
+        );
+        assert_eq!(restored.window_position, Some([42.0, 63.0]));
+    }
+
+    #[test]
+    fn restored_hidden_document_is_rendered_only_when_activated() {
+        let (_dir, mut app, root) = file_fixture();
+        let first = open_test_reader(&mut app, &root);
+        let second_path = root.join("second.pdf");
+        std::fs::write(&second_path, include_bytes!("../tests/fixtures/reader.pdf")).unwrap();
+        let _ = app.update(Message::Opened(Some(LoadedFile::read(&second_path))));
+        app.workspace_snapshot().save(&root).unwrap();
+        app.apply_volume(OpenedVolume::open(&root, &app.base_settings).unwrap())
+            .unwrap();
+        let _ = app.update(Message::RestoreReaders);
+        assert!(app.readers[&app.active.unwrap()].worker.is_some());
+        assert!(app.readers[&first].worker.is_none());
+        let _ = app.update(Message::Activate(first));
+        assert!(app.readers[&first].worker.is_some());
+    }
+
+    #[test]
+    fn changing_volumes_keeps_current_window_geometry() {
+        let (dir, mut app, _root) = file_fixture();
+        let _ = app.update(Message::Viewport(iced::Size::new(1320.0, 840.0)));
+        let _ = app.update(Message::WindowMoved(iced::Point::new(-200.0, 100.0)));
+        let other = OpenedVolume::create(dir.path(), "Other volume", &app.base_settings).unwrap();
+        app.apply_volume(other).unwrap();
+        assert_eq!((app.viewport_width, app.viewport_height), (1320.0, 840.0));
+        assert_eq!(app.window_position, Some([-200.0, 100.0]));
+    }
+
     #[test]
     fn resize_retains_rendered_pages_and_continuous_scroll_tracks_page() {
         let (_dir, mut app, root) = file_fixture();
@@ -3034,6 +3950,50 @@ mod tests {
         assert_eq!(app.readers[&id].position.page, 1);
         finish_test_render(&mut app, id);
         assert!(!app.readers[&id].loading);
+    }
+
+    #[test]
+    fn prefetched_page_navigation_reuses_the_existing_image_without_loading() {
+        let (_dir, mut app, root) = file_fixture();
+        let id = open_test_reader(&mut app, &root);
+        let request = app.readers[&id].request;
+        let width = app.readers[&id].pixel_width;
+        let page = enote::reader::render(
+            include_bytes!("../tests/fixtures/reader.pdf"),
+            "pdf",
+            1,
+            width,
+        )
+        .unwrap();
+        let _ = app.update(Message::ReaderPrefetched(id, request, Ok(page)));
+        let handle = app.readers[&id].pages[&1].handle.clone();
+        let _ = app.update(Message::Reader(id, ReaderAction::Next));
+        assert!(!app.readers[&id].loading);
+        finish_test_render(&mut app, id);
+        assert_eq!(app.readers[&id].image.as_ref(), Some(&handle));
+        assert!(app.readers[&id].pages.contains_key(&0));
+    }
+
+    #[test]
+    fn fast_scroll_updates_the_target_even_when_previous_page_is_loading() {
+        let (_dir, mut app, root) = file_fixture();
+        let id = open_test_reader(&mut app, &root);
+        for page in [1, 2] {
+            let viewer = &app.readers[&id];
+            let (request, slot) = (viewer.request, viewer.slot_height());
+            let _ = app.update(Message::Reader(
+                id,
+                ReaderAction::StreamScroll {
+                    request,
+                    x: 0.0,
+                    y: slot * (page as f32 + 0.2),
+                },
+            ));
+            assert_eq!(app.readers[&id].position.page, page);
+        }
+        finish_test_render(&mut app, id);
+        assert!(!app.readers[&id].loading);
+        assert!(app.readers[&id].pages.contains_key(&2));
     }
 
     #[test]

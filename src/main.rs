@@ -16,14 +16,29 @@ fn main() -> iced::Result {
         eprintln!("Startup: {}", startup.warnings);
     }
     let settings = startup.settings();
-    let window_size = (settings.window.width as f32, settings.window.height as f32);
+    let window_size = startup
+        .window
+        .as_ref()
+        .map(|w| (w.width, w.height))
+        .unwrap_or((settings.window.width as f32, settings.window.height as f32));
+    let position = startup
+        .window
+        .as_ref()
+        .and_then(|w| w.position)
+        .map(|[x, y]| iced::window::Position::Specific(iced::Point::new(x, y)))
+        .unwrap_or_default();
     iced::application(
-        move || Enote::from_startup(startup.clone()),
+        move || {
+            let mut app = Enote::from_startup(startup.clone());
+            let task = app.startup_tasks();
+            (app, task)
+        },
         Enote::update,
         Enote::view,
     )
     .title("eNote")
     .window_size(window_size)
+    .position(position)
     .font(lucide_icons::LUCIDE_FONT_BYTES)
     .theme(|_: &Enote| appearance::theme())
     .exit_on_close_request(false)

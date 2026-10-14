@@ -226,61 +226,73 @@ pub fn render(
     if !pixel_width.is_finite() {
         return Err("Invalid render size".into());
     }
-    use mupdf::{Colorspace, Document, Matrix};
-    let mut document = Document::from_bytes(bytes, extension).map_err(|e| e.to_string())?;
-    if document.needs_password().map_err(|e| e.to_string())? {
-        return Err(
-            "This document requires a password; encrypted documents are not supported yet".into(),
-        );
+    match extension.to_ascii_lowercase().as_str() {
+        "pdf" => render_pdf(bytes, page, pixel_width),
+        "cbz" => book::render_comic(bytes, page, pixel_width),
+        "epub" | "fb2" => book::render_book(bytes, extension, page, pixel_width),
+        _ => Err(format!("Unsupported document format: {extension}")),
     }
-    if document.is_reflowable().map_err(|e| e.to_string())? {
-        document
-            .layout(480.0, 720.0, 16.0)
-            .map_err(|e| e.to_string())?;
-    }
-    let count = document.page_count().map_err(|e| e.to_string())?;
-    if count <= 0 {
-        return Err("The document has no pages".into());
-    }
-    let index = page.min(count as u32 - 1);
-    let page = document
-        .load_page(index as i32)
-        .map_err(|e| e.to_string())?;
-    let bounds = page.bounds().map_err(|e| e.to_string())?;
-    let width = bounds.x1 - bounds.x0;
-    let height = bounds.y1 - bounds.y0;
+}
+
+mod book;
+mod worker;
+pub use worker::RenderWorker;
+
+// Bound both the area and individual dimensions before allocating a bitmap.
+fn render_size(width: f32, height: f32, pixel_width: f32) -> Result<(u32, u32), String> {
     if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
         return Err("Invalid page dimensions".into());
     }
-    let requested = pixel_width.clamp(256.0, 2400.0);
-    let scale = (requested / width).min((12_000_000.0 / (width * height)).sqrt());
-    let pixmap = page
-        .to_pixmap(
-            &Matrix::new_scale(scale, scale),
-            &Colorspace::device_rgb(),
-            false,
-            true,
-        )
-        .map_err(|e| e.to_string())?;
-    if pixmap.n() != 3 {
-        return Err("Unexpected document pixel format".into());
+    let scale = (pixel_width.clamp(256.0, 2400.0) / width)
+        .min((12_000_000.0 / (width as f64 * height as f64)).sqrt() as f32)
+        .min(65_000.0 / width.max(height));
+    let w = (width * scale).floor() as u32;
+    let h = (height * scale).floor() as u32;
+    if w == 0 || h == 0 {
+        return Err("Invalid rendered page dimensions".into());
     }
-    let mut rgba = Vec::with_capacity(pixmap.width() as usize * pixmap.height() as usize * 4);
-    for row in pixmap
-        .samples()
-        .chunks(pixmap.stride() as usize)
-        .take(pixmap.height() as usize)
-    {
-        for pixel in row[..pixmap.width() as usize * 3].chunks_exact(3) {
-            rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
-        }
+    Ok((w, h))
+}
+
+fn render_pdf(bytes: &[u8], page: u32, pixel_width: f32) -> Result<RenderedPage, String> {
+    use hayro::{RenderCache, hayro_syntax::Pdf};
+    let document = Pdf::new(bytes.to_vec()).map_err(|e| format!("Cannot open PDF: {e:?}"))?;
+    render_pdf_page(&document, &RenderCache::new(), page, pixel_width)
+}
+
+fn render_pdf_page<'a>(
+    document: &'a hayro::hayro_syntax::Pdf,
+    cache: &hayro::RenderCache<'a>,
+    page: u32,
+    pixel_width: f32,
+) -> Result<RenderedPage, String> {
+    use hayro::{PixmapSettings, RenderSettings};
+    let pages = document.pages();
+    let count = u32::try_from(pages.len()).map_err(|_| "Too many document pages")?;
+    if count == 0 {
+        return Err("The document has no pages".into());
     }
+    let index = page.min(count - 1);
+    let page = &pages[index as usize];
+    let (width, height) = page.render_dimensions();
+    let (w, h) = render_size(width, height, pixel_width)?;
+    let pixmap = hayro::render(
+        page,
+        cache,
+        &Default::default(),
+        &RenderSettings::default(),
+        &PixmapSettings {
+            x_scale: w as f32 / width,
+            y_scale: h as f32 / height,
+            bg_color: hayro::vello_cpu::color::palette::css::WHITE,
+        },
+    );
     Ok(RenderedPage {
         page: index,
-        count: count as u32,
-        width: pixmap.width(),
-        height: pixmap.height(),
-        rgba: rgba.into(),
+        count,
+        width: pixmap.width() as u32,
+        height: pixmap.height() as u32,
+        rgba: pixmap.data_as_u8_slice().into(),
     })
 }
 
@@ -316,7 +328,7 @@ mod tests {
             ("mimetype", "application/epub+zip".to_string()),
             ("META-INF/container.xml", "<?xml version=\"1.0\"?><container version=\"1.0\" xmlns=\"urn:oasis:names:tc:opendocument:xmlns:container\"><rootfiles><rootfile full-path=\"book.opf\" media-type=\"application/oebps-package+xml\"/></rootfiles></container>".into()),
             ("book.opf", "<?xml version=\"1.0\"?><package version=\"2.0\" unique-identifier=\"id\" xmlns=\"http://www.idpf.org/2007/opf\"><metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><dc:title>Reader Test</dc:title><dc:identifier id=\"id\">enote-reader-test</dc:identifier><dc:language>en</dc:language></metadata><manifest><item id=\"chapter\" href=\"chapter.xhtml\" media-type=\"application/xhtml+xml\"/></manifest><spine><itemref idref=\"chapter\"/></spine></package>".into()),
-            ("chapter.xhtml", format!("<html xmlns=\"http://www.w3.org/1999/xhtml\"><head><title>Book</title></head><body><h1>EPUB Reader Test</h1>{}</body></html>", "<p>This electronic book is rendered by MuPDF inside an eNote buffer.</p>".repeat(200))),
+            ("chapter.xhtml", format!("<html xmlns=\"http://www.w3.org/1999/xhtml\"><head><title>Book</title></head><body><h1>EPUB Reader Test</h1>{}</body></html>", "<p>This electronic book is rendered by Rust inside an eNote buffer.</p>".repeat(200))),
         ];
         for (name, content) in files {
             archive
@@ -328,7 +340,7 @@ mod tests {
     }
 
     #[test]
-    fn epub_and_fictionbook_are_paginated_by_mupdf() {
+    fn epub_and_fictionbook_are_paginated_by_rust() {
         let book = epub();
         let page = render(&book, "epub", 1, 600.0).unwrap();
         assert!(page.count > 2);
